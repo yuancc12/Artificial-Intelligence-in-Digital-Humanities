@@ -1,19 +1,25 @@
-from flask import Flask, request, abort
+import openai
+import tempfile
+import os
+import subprocess  # 用來調用 ffmpeg 進行音頻轉換
+from flask import Flask, request, abort, jsonify
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, AudioMessage, TextSendMessage
-from transformers import pipeline
-import os
-import tempfile
-import requests
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, AudioMessage
+import speech_recognition as sr
+
+# OpenAI API Key
+openai.api_key = '請輸入OpenAI key'
+
+# 設置環境變量禁用 oneDNN 優化（可選）
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 # 初始化 Flask 和 LINE Bot
 app = Flask(__name__)
-line_bot_api = LineBotApi('請輸入LINE API')
-handler = WebhookHandler('請輸入LINE Secret')
 
-# Whisper 語音識別管道
-whisper = pipeline('automatic-speech-recognition', model='openai/whisper-medium', device=-1)
+# LINE Messaging API 設定
+line_bot_api = LineBotApi('請輸入Line API key')
+handler = WebhookHandler('請輸入Line Secret')
 
 # 接收 LINE 的 Webhook 事件
 @app.route("/callback", methods=['POST'])
@@ -25,29 +31,72 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        abort(400)
-
+        return jsonify({'message': 'Invalid signature'}), 400
     return 'OK'
 
-# 處理接收到的音訊消息
+# 處理收到的音頻消息
 @handler.add(MessageEvent, message=AudioMessage)
 def handle_audio_message(event):
-    # 下載音訊文件
-    message_content = line_bot_api.get_message_content(event.message.id)
-    with tempfile.NamedTemporaryFile(dir='.', suffix='.m4a', delete=False) as tf:
-        for chunk in message_content.iter_content():
-            tf.write(chunk)
-        temp_file_path = tf.name
+    message_id = event.message.id
+    message_content = line_bot_api.get_message_content(message_id)
 
-    # 使用 Whisper 進行語音識別
-    text_result = whisper(temp_file_path)
+    # 保存音频到本地
+    with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as tf:
+        tf.write(message_content.content)
+        audio_path = tf.name
 
-    # 回傳轉錄結果
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=text_result['text'])
+    try:
+        # 將 .m4a 文件轉換為 .wav 文件
+        wav_path = convert_to_wav(audio_path)
+
+        # 使用本地語音轉文字方法將語音轉為文本
+        transcript = transcribe_audio(wav_path)
+
+        # 使用 OpenAI API 提取摘要並格式化
+        summary = summarize_with_openai(transcript)
+        reply_message = f"{summary}"
+
+        # 回復用戶
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_message))
+    except Exception as e:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"抱歉，無法處理您的錄音。錯誤信息: {str(e)}"))
+
+# 將 .m4a 轉換為 .wav 的函數
+def convert_to_wav(audio_path):
+    wav_path = audio_path.replace('.m4a', '.wav')
+    try:
+        subprocess.run(['ffmpeg', '-i', audio_path, wav_path], check=True)
+        return wav_path
+    except subprocess.CalledProcessError as e:
+        raise Exception(f"音頻轉換失敗: {e}")
+
+# 定義語音轉文字函數（使用 SpeechRecognition 庫）
+def transcribe_audio(audio_path):
+    recognizer = sr.Recognizer()
+    try:
+        with sr.AudioFile(audio_path) as source:
+            audio = recognizer.record(source)  # 讀取音頻文件
+            # 使用 Google Web API 進行語音識別
+            transcript = recognizer.recognize_google(audio, language="zh-CN")
+            return transcript
+    except sr.UnknownValueError:
+        return "無法識別音訊內容。"
+    except sr.RequestError as e:
+        return f"語音識別服務不可用: {e}"
+
+# 使用 OpenAI 提取摘要
+def summarize_with_openai(transcript):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "你是一個有用的會議記錄助手，幫助用戶開會的重點進行記錄，列點給我，不要多說別的東西。"},
+            {"role": "user", "content": f"請總結以下文本的重點：{transcript}"}
+        ]
     )
 
-# 主程序
+    summary = response['choices'][0]['message']['content']
+    return summary
+
+# 啟動 Flask 應用
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(port=5000, debug=True)
